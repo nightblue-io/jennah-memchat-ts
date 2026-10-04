@@ -74,7 +74,8 @@ Claude on Amazon Bedrock is never picked automatically. Choose it and name the
 AWS profile:
 
 ```sh
-memchat-ts --provider bedrock --aws-profile my-profile   # --aws-region defaults to ap-northeast-1
+# --aws-region defaults to ap-northeast-1
+memchat-ts --provider bedrock --aws-profile my-profile
 ```
 
 Pass the profile with `--aws-profile` rather than `AWS_PROFILE`: when
