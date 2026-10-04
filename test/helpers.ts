@@ -29,12 +29,14 @@ export class Events {
 export class FakeBrain implements Brain {
   readonly label = "fake/brain";
   systems: string[] = [];
+  personas: string[] = [];
   constructor(
     public reply = "ok",
     public facts: Fact[] = [],
   ) {}
-  async chat(system: string): Promise<Answer> {
-    this.systems.push(system);
+  async chat(persona: string, recall: string): Promise<Answer> {
+    this.personas.push(persona);
+    this.systems.push(`${persona}\n\n${recall}`);
     return { reply: this.reply, facts: [...this.facts] };
   }
 }

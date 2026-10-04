@@ -29,7 +29,7 @@ import { Client, create, DEFAULT_ENDPOINT, JennahError, NoCredentialError } from
 import { ConversationTurnSchema, TurnRole, type ConversationTurn } from "jennah-sdk-ts/gen/jennah/agent/v1/memory_pb";
 
 import { commitRequest, randId, seedRequest, STORE_INSTRUCTION, type Fact } from "./authored.js";
-import { newBrain, type Brain } from "./brain.js";
+import { DEFAULT_AWS_REGION, newBrain, type Brain } from "./brain.js";
 import * as jennah from "./jennah.js";
 import { commitLines, formationLines, type Line, type Style } from "./receipt.js";
 
@@ -85,7 +85,12 @@ export function formationKey(sessionId: string, turnNo: number): string {
 }
 
 /**
- * The turn's system prompt, from what Jennah recalled.
+ * The fixed half of the system prompt: who the model is and what it is for.
+ *
+ * It must come out the same on every turn of a session (the Claude brain sends
+ * it as a top-level system prompt that may not change mid-conversation), so it
+ * reads nothing but the arm, fixed at startup. Recalled memory goes in
+ * buildRecall.
  *
  * The instruction about STORING memory appears only in the authored arm, and
  * its absence by default is not a simplification: a prompt telling the model
@@ -93,13 +98,19 @@ export function formationKey(sessionId: string, turnNo: number): string {
  * would be two extractors with one workspace, disagreeing at the caller's
  * expense.
  */
-export function buildSystemPrompt(rec: jennah.Recall, authored: boolean): string {
+export function buildPersona(authored: boolean): string {
   const parts = [
     "You are Memo, a warm, concise assistant with long-term memory that persists across sessions. " +
-      "Personalize using the remembered context below and refer back to it naturally. ",
+      "Each user message is followed by what you remember that is relevant to it. Personalize using " +
+      "that remembered context and refer back to it naturally; the most recent one is current. ",
   ];
   if (authored) parts.push(STORE_INSTRUCTION);
-  parts.push("\n\n# What you already know (knowledge graph)\n");
+  return parts.join("");
+}
+
+/** What Jennah recalled for this turn. */
+export function buildRecall(rec: jennah.Recall): string {
+  const parts = ["# What you already know (knowledge graph)\n"];
   if (rec.facts.length) parts.push(...rec.facts.map((f) => `- ${f}\n`));
   else parts.push("(nothing yet, this may be your first conversation)\n");
   parts.push("\n# Relevant snippets from past conversations\n");
@@ -157,7 +168,7 @@ export class Chat {
     let reply: string;
     let facts: Fact[];
     try {
-      ({ reply, facts } = await this.brain.chat(buildSystemPrompt(rec, authored), line));
+      ({ reply, facts } = await this.brain.chat(buildPersona(authored), buildRecall(rec), line));
     } catch (e) {
       // The vendor SDKs throw their own types.
       if (!signal?.aborted) out("err", `error: chat model: ${jennah.describe(e)}`);
@@ -215,6 +226,8 @@ const OPTIONS = {
   state: { type: "string", default: "memchat-state.json" },
   agent: { type: "string", default: "" },
   provider: { type: "string", default: "auto" },
+  "aws-region": { type: "string", default: DEFAULT_AWS_REGION },
+  "aws-profile": { type: "string", default: "" },
   region: { type: "string" },
   "jennah-api-key": { type: "string", default: "" },
   "anthropic-api-key": { type: "string", default: "" },
@@ -239,8 +252,16 @@ flags:
                              in the state file, for a workspace provisioned out of
                              band (e.g. one with a vocabulary declared on it).
                              Never creates and never writes the state file
-  --provider NAME            chat model: auto|gemini|anthropic (default auto:
-                             Anthropic if its key is set, else Gemini)
+  --provider NAME            chat model: auto|anthropic|bedrock|gemini (default
+                             auto: Anthropic if its key is set, else Gemini;
+                             bedrock is Claude on Amazon Bedrock and is never
+                             picked by auto)
+  --aws-region REGION        AWS region for --provider bedrock
+                             (default ${DEFAULT_AWS_REGION})
+  --aws-profile NAME         AWS named profile for --provider bedrock; empty uses
+                             the default credential chain. Prefer this over
+                             AWS_PROFILE, which exported AWS_ACCESS_KEY_ID
+                             silently overrides
   --region REGION            home region for a NEW workspace (e.g. us-central1),
                              also read from $JENNAH_REGION; empty uses the platform
                              default. List regions with 'jnh agents regions'
@@ -260,6 +281,8 @@ export interface Args {
   state: string;
   agent: string;
   provider: string;
+  awsRegion: string;
+  awsProfile: string;
   region: string;
   jennahApiKey: string;
   anthropicApiKey: string;
@@ -276,6 +299,8 @@ export function parseFlags(argv: string[], env: NodeJS.ProcessEnv = process.env)
     state: v.state,
     agent: v.agent,
     provider: v.provider,
+    awsRegion: v["aws-region"],
+    awsProfile: v["aws-profile"],
     // The region is not a secret, so its env var may stand in for the flag.
     region: v.region ?? env.JENNAH_REGION ?? "",
     jennahApiKey: v["jennah-api-key"],
@@ -341,7 +366,7 @@ export async function main(argv: string[], deps: Deps = {}): Promise<number> {
     client = connect(args);
     const anthropicKey = args.anthropicApiKey.trim() || env.ANTHROPIC_API_KEY || "";
     try {
-      brain = (deps.brain ?? ((p, k, t) => newBrain(p, k, t, env)))(args.provider, anthropicKey, args.authored);
+      brain = (deps.brain ?? ((p, k, t) => newBrain(p, k, t, env, { region: args.awsRegion, profile: args.awsProfile })))(args.provider, anthropicKey, args.authored);
     } catch (e) {
       throw new jennah.StartupError((e as Error).message);
     }

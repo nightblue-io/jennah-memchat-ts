@@ -1,8 +1,8 @@
-// The pluggable chat model: Claude through @anthropic-ai/sdk, or Gemini through
-// @google/genai.
+// The pluggable chat model: Claude through @anthropic-ai/sdk (directly or on
+// Amazon Bedrock), or Gemini through @google/genai.
 //
 // A brain owns the session-local conversation history, so the current chat
-// stays coherent, and turns a freshly built system prompt plus the user's
+// stays coherent, and turns the persona, freshly recalled memory and the user's
 // message into a reply. Long-term memory is Jennah's; nothing Jennah-facing
 // depends on which brain answered.
 //
@@ -12,11 +12,19 @@
 // change formation makes to a client: not a different call, one fewer job.
 
 import Anthropic from "@anthropic-ai/sdk";
+import { AnthropicBedrock } from "@anthropic-ai/bedrock-sdk";
+import { fromIni } from "@aws-sdk/credential-providers";
 import { GoogleGenAI, Type, type Content, type GenerateContentConfig, type Part, type Tool } from "@google/genai";
 
 import { factFromArgs, TOOL_DESC, TOOL_NAME, TOOL_PROPERTIES, TOOL_REQUIRED, type Fact } from "./authored.js";
 
 export const ANTHROPIC_MODEL = "claude-sonnet-5-5";
+// The same model on Amazon Bedrock. It is a cross-region inference profile id,
+// not a bare model id: Bedrock serves current Claude models only through a
+// profile, and "global." routes to whichever region has capacity at no premium
+// over a single-region profile.
+export const BEDROCK_MODEL = "global.anthropic.claude-sonnet-5-5";
+export const DEFAULT_AWS_REGION = "ap-northeast-1";
 // The same id works on AI Studio and on Vertex AI.
 export const GEMINI_MODEL = "gemini-3.8-flash";
 const MAX_TOKENS = 2048;
@@ -28,7 +36,18 @@ export interface Answer {
 
 export interface Brain {
   readonly label: string;
-  chat(system: string, userMsg: string): Promise<Answer>;
+  /**
+   * persona is the fixed instruction (the same every turn of a session) and
+   * recall is this turn's remembered context. They arrive separately because
+   * the Claude brain must keep the first unchanged and append the second.
+   */
+  chat(persona: string, recall: string, userMsg: string): Promise<Answer>;
+}
+
+/** Where --provider bedrock sends requests, and the named profile that signs them. */
+export interface AwsTarget {
+  region: string;
+  profile: string;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -46,36 +65,85 @@ export function useVertex(env: Env): boolean {
  * Resolve --provider. "auto" prefers Anthropic when an Anthropic key is
  * present, else Gemini when a Studio key or Vertex configuration is, so someone
  * with one key set needs no flag.
+ *
+ * "bedrock" (Claude on Amazon Bedrock) is never chosen by "auto": AWS
+ * credentials are present in many shells for reasons that have nothing to do
+ * with this demo, so having them is no sign of intent.
  */
-export function selectProvider(provider: string, anthropicKey: string, env: Env): "anthropic" | "gemini" {
+export function selectProvider(provider: string, anthropicKey: string, env: Env): "anthropic" | "bedrock" | "gemini" {
   const p = provider.toLowerCase();
   if (p === "auto") {
     if (anthropicKey) return "anthropic";
     if (env.GEMINI_API_KEY || env.GOOGLE_API_KEY || useVertex(env)) return "gemini";
     throw new Error(
-      "no chat credentials found: set GEMINI_API_KEY or the Vertex AI env (Gemini), " +
-        "or pass --anthropic-api-key / set ANTHROPIC_API_KEY (Anthropic), or pass --provider",
+      "no chat credentials found: pass --anthropic-api-key / set ANTHROPIC_API_KEY (Anthropic), " +
+        "pass --provider bedrock (Claude on Amazon Bedrock, explicit only), " +
+        "or set the Vertex AI env / GEMINI_API_KEY (Gemini)",
     );
   }
   if (p === "anthropic" || p === "claude") return "anthropic";
+  if (p === "bedrock") return "bedrock";
   if (p === "gemini") return "gemini";
-  throw new Error(`unknown --provider '${provider}' (want auto|gemini|anthropic)`);
+  throw new Error(`unknown --provider '${provider}' (want auto|anthropic|bedrock|gemini)`);
 }
 
-export function newBrain(provider: string, anthropicKey: string, offerTool: boolean, env: Env = process.env): Brain {
-  if (selectProvider(provider, anthropicKey, env) === "anthropic") return new AnthropicBrain(anthropicKey, offerTool);
-  return new GeminiBrain(offerTool, env);
+export function newBrain(
+  provider: string,
+  anthropicKey: string,
+  offerTool: boolean,
+  env: Env = process.env,
+  aws: AwsTarget = { region: DEFAULT_AWS_REGION, profile: "" },
+): Brain {
+  switch (selectProvider(provider, anthropicKey, env)) {
+    case "anthropic":
+      return new AnthropicBrain(anthropicKey, offerTool);
+    case "bedrock":
+      return bedrockBrain(offerTool, aws);
+    default:
+      return new GeminiBrain(offerTool, env);
+  }
+}
+
+/**
+ * Claude on Amazon Bedrock: the Anthropic brain with a Bedrock client, whose
+ * requests are signed by AWS credentials instead of an Anthropic key.
+ *
+ * A named profile is resolved from that profile alone rather than left to
+ * AWS_PROFILE, because the default chain reads AWS_ACCESS_KEY_ID first: with
+ * bare keys exported, AWS_PROFILE is silently ignored and the calls run, without
+ * error, in whatever account those keys belong to.
+ */
+export function bedrockBrain(offerTool: boolean, aws: AwsTarget): AnthropicBrain {
+  if (!aws.region) throw new Error("--provider bedrock needs an AWS region: pass --aws-region");
+  const client = new AnthropicBedrock({
+    awsRegion: aws.region,
+    ...(aws.profile ? { providerChainResolver: async () => fromIni({ profile: aws.profile }) } : {}),
+  });
+  return new AnthropicBrain("", offerTool, client, { model: BEDROCK_MODEL, via: "bedrock" });
+}
+
+/** The one resource AnthropicBrain needs, shared by the direct and Bedrock clients. */
+export interface AnthropicMessages {
+  messages: Pick<Anthropic["messages"], "create">;
 }
 
 export class AnthropicBrain implements Brain {
-  readonly label = `anthropic/${ANTHROPIC_MODEL}`;
-  private readonly client: Anthropic;
+  readonly label: string;
+  private readonly client: AnthropicMessages;
+  private readonly model: string;
   private readonly history: Anthropic.MessageParam[] = [];
   private readonly tools: Anthropic.Tool[] = [];
 
-  constructor(apiKey: string, offerTool: boolean, client?: Anthropic) {
+  constructor(
+    apiKey: string,
+    offerTool: boolean,
+    client?: AnthropicMessages,
+    { model = ANTHROPIC_MODEL, via = "anthropic" }: { model?: string; via?: string } = {},
+  ) {
     // An empty key leaves the SDK's own ANTHROPIC_API_KEY lookup in charge.
     this.client = client ?? new Anthropic(apiKey ? { apiKey } : {});
+    this.model = model;
+    this.label = `${via}/${model}`;
     if (offerTool) {
       this.tools.push({
         name: TOOL_NAME,
@@ -91,15 +159,34 @@ export class AnthropicBrain implements Brain {
     }
   }
 
-  async chat(system: string, userMsg: string): Promise<Answer> {
-    this.history.push({ role: "user", content: userMsg });
+  /**
+   * persona goes out as the top-level system prompt, which never changes during
+   * a session, and the turn's recall as a system MESSAGE right after the user's.
+   *
+   * Rebuilding the top-level prompt each turn with fresh recall is the obvious
+   * shape and the wrong one. A thinking block is bound to the exact conversation
+   * prefix it was produced under, the system prompt included, and an
+   * organization created on or after 2026-08-31 is refused (400) when an earlier
+   * block is replayed under a different prefix. So turn 2 of such a session
+   * failed, on Bedrock and on the direct API alike, while older organizations
+   * never saw it. Appending recall instead edits nothing that came before: every
+   * earlier block stays valid, and the unchanged prefix is cacheable as a bonus.
+   *
+   * Old recall stays in the transcript, so a long session carries every
+   * snapshot (more input tokens per turn). A mid-conversation system message
+   * needs a model that accepts one: Sonnet 5.5 does; Sonnet 5 answers 400
+   * "role 'system' is not supported", so swapping the model to it means moving
+   * recall into the user turn.
+   */
+  async chat(persona: string, recall: string, userMsg: string): Promise<Answer> {
+    this.history.push({ role: "user", content: userMsg }, { role: "system", content: recall });
     const facts: Fact[] = [];
     const reply: string[] = [];
     for (;;) {
       const resp = await this.client.messages.create({
-        model: ANTHROPIC_MODEL,
+        model: this.model,
         max_tokens: MAX_TOKENS,
-        system,
+        system: persona,
         messages: this.history,
         thinking: { type: "adaptive" },
         ...(this.tools.length ? { tools: this.tools } : {}),
@@ -175,12 +262,14 @@ export class GeminiBrain implements Brain {
     this.label = `gemini/${GEMINI_MODEL} (${backend})`;
   }
 
-  async chat(system: string, userMsg: string): Promise<Answer> {
-    // The system prompt embeds freshly recalled memory, so it is set per
-    // request. Automatic function calling is off because the loop below
-    // handles remember_fact itself.
+  async chat(persona: string, recall: string, userMsg: string): Promise<Answer> {
+    // The system instruction embeds freshly recalled memory, so it is set per
+    // request. Gemini does not bind its history to the instruction it was
+    // produced under, so unlike the Claude brain this needs no append-only
+    // shape. Automatic function calling is off because the loop below handles
+    // remember_fact itself.
     const config: GenerateContentConfig = {
-      systemInstruction: system,
+      systemInstruction: `${persona}\n\n${recall}`,
       maxOutputTokens: MAX_TOKENS,
       automaticFunctionCalling: { disable: true },
       ...(this.tools ? { tools: this.tools } : {}),

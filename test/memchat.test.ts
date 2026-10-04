@@ -33,7 +33,7 @@ import {
 import type { CreateAgentRequest } from "jennah-sdk-ts/gen/jennah/agent/v1/agent_pb";
 
 import { commitRequest, nodeId, normRel, seedRequest, type Fact } from "../src/authored.js";
-import { AnthropicBrain, GeminiBrain, selectProvider, type GeminiModels } from "../src/brain.js";
+import { AnthropicBrain, bedrockBrain, GeminiBrain, selectProvider, type GeminiModels } from "../src/brain.js";
 import * as jennah from "../src/jennah.js";
 import { connect, main, parseFlags } from "../src/main.js";
 import { commitLines, formationLines, type Line } from "../src/receipt.js";
@@ -326,6 +326,15 @@ test("auto provider selection", async () => {
   assert.throws(() => selectProvider("openai", "", {}), /unknown --provider/);
 });
 
+test("bedrock is explicit only", () => {
+  assert.equal(selectProvider("bedrock", "", {}), "bedrock");
+  // AWS credentials in the environment are no sign of intent, so auto never picks it.
+  const aws = { AWS_ACCESS_KEY_ID: "AKIA", AWS_SECRET_ACCESS_KEY: "s", AWS_PROFILE: "p" };
+  assert.throws(() => selectProvider("auto", "", aws), /no chat credentials/);
+  assert.throws(() => bedrockBrain(false, { region: "", profile: "p" }), /needs an AWS region/);
+  assert.equal(bedrockBrain(false, { region: "ap-northeast-1", profile: "p" }).label, "bedrock/global.anthropic.claude-sonnet-5-5");
+});
+
 type Req = Record<string, unknown> & { messages: unknown[] };
 
 function anthropicStub(responses: unknown[]): { client: Anthropic; requests: Req[] } {
@@ -347,9 +356,30 @@ const textResp = (text: string) => ({ content: [{ type: "text", text }], stop_re
 test("anthropic: the default arm sends no tools", async () => {
   const stub = anthropicStub([textResp("hello")]);
   const b = new AnthropicBrain("", false, stub.client);
-  assert.deepEqual(await b.chat("sys", "hi"), { reply: "hello", facts: [] });
+  assert.deepEqual(await b.chat("persona", "recall", "hi"), { reply: "hello", facts: [] });
   assert.ok(!("tools" in stub.requests[0]!));
-  assert.equal(stub.requests[0]!.system, "sys");
+  assert.equal(stub.requests[0]!.system, "persona");
+});
+
+test("anthropic: recall is appended, never edited", async () => {
+  // The persona stays the top-level system prompt and each turn's recall is a
+  // system message after the user's, so every request extends the last one
+  // instead of rewriting it (earlier thinking blocks are bound to that prefix).
+  const stub = anthropicStub([textResp("one"), textResp("two")]);
+  const b = new AnthropicBrain("", false, stub.client);
+  await b.chat("persona", "recall 1", "hi");
+  await b.chat("persona", "recall 2", "again");
+  const [first, second] = stub.requests;
+  assert.deepEqual(first!.messages, [
+    { role: "user", content: "hi" },
+    { role: "system", content: "recall 1" },
+  ]);
+  assert.equal(second!.system, "persona");
+  assert.deepEqual(second!.messages.slice(0, 2), first!.messages);
+  assert.deepEqual(second!.messages.slice(3), [
+    { role: "user", content: "again" },
+    { role: "system", content: "recall 2" },
+  ]);
 });
 
 test("anthropic: the authored arm collects facts", async () => {
@@ -358,7 +388,7 @@ test("anthropic: the authored arm collects facts", async () => {
     textResp("noted!"),
   ]);
   const b = new AnthropicBrain("", true, stub.client);
-  const { reply, facts } = await b.chat("sys", "I live in Tokyo");
+  const { reply, facts } = await b.chat("persona", "recall", "I live in Tokyo");
   assert.equal(reply, "noted!");
   assert.deepEqual(facts, [{ subj: "", rel: "lives in", obj: "Tokyo" }]);
   assert.equal((stub.requests[0]!.tools as { name: string }[])[0]!.name, "remember_fact");
@@ -380,14 +410,15 @@ function geminiStub(text: string): { models: GeminiModels; configs: Record<strin
 test("gemini: the default arm sends no tools", async () => {
   const stub = geminiStub("hi there");
   const b = new GeminiBrain(false, { GEMINI_API_KEY: "k" }, stub.models);
-  assert.deepEqual(await b.chat("sys", "hi"), { reply: "hi there", facts: [] });
+  assert.deepEqual(await b.chat("persona", "recall", "hi"), { reply: "hi there", facts: [] });
   assert.ok(!stub.configs[0]!.tools);
+  assert.equal(stub.configs[0]!.systemInstruction, "persona\n\nrecall");
   assert.ok(b.label.endsWith("(ai-studio)"));
 });
 
 test("gemini: the authored arm offers remember_fact", async () => {
   const stub = geminiStub("ok");
-  await new GeminiBrain(true, { GEMINI_API_KEY: "k" }, stub.models).chat("sys", "hi");
+  await new GeminiBrain(true, { GEMINI_API_KEY: "k" }, stub.models).chat("persona", "recall", "hi");
   const tools = stub.configs[0]!.tools as { functionDeclarations: { name: string; parameters: { properties: object; required: string[] } }[] }[];
   const decl = tools[0]!.functionDeclarations[0]!;
   assert.equal(decl.name, "remember_fact");
@@ -404,6 +435,15 @@ test("the default prompt has no store instruction", async () => {
   const { c, brain } = chat(w);
   await c.turn("hi");
   assert.ok(!brain.systems[0]!.includes("remember_fact") && !brain.systems[0]!.toLowerCase().includes("store"));
+});
+
+test("the persona is fixed across turns and carries no recall", async () => {
+  const { c, brain } = chat(w);
+  await c.turn("hi");
+  await c.turn("again");
+  assert.equal(brain.personas[0], brain.personas[1]);
+  assert.ok(!brain.personas[0]!.includes("# What you already know"));
+  assert.ok(brain.systems[1]!.includes("# What you already know"));
 });
 
 // ---- 3.2 the turn loop ----

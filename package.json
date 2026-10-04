@@ -28,7 +28,9 @@
     "test": "rm -rf build && tsc -p tsconfig.test.json && node --test --test-concurrency=1 --test-force-exit 'build/test/**/*.test.js'"
   },
   "dependencies": {
+    "@anthropic-ai/bedrock-sdk": "^0.34.2",
     "@anthropic-ai/sdk": "^0.129.0",
+    "@aws-sdk/credential-providers": "^3.1146.0",
     "@google/genai": "^2.24.0",
     "jennah-sdk-ts": "^0.64.0"
   },
